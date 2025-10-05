@@ -1,0 +1,16 @@
+streamlit
+langchain
+langchain-community
+langchain-huggingface
+langchain-google-genai
+langchain-chroma
+faiss-cpu
+sentence-transformers
+pypdf
+python-dotenv
+google-generativeai
+torch
+transformers
+pandas
+flashrank
+chromadb
