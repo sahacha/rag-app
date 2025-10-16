@@ -81,6 +81,6 @@ st.components.v1.html(
 
 chat_rag = st.Page("chat_rag.py", title="Chiang Mai Q&A Travel & Planing")
 pg = st.navigation(
-    [chat_rag, chat_history]
+    [chat_rag]
 )
 pg.run()
