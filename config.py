@@ -43,15 +43,14 @@ class Config:
     @classmethod
     def validate_config(cls):
         """Validate required configuration"""
-        required_vars = []
-
-        if not cls.GOOGLE_API_KEY:
-            required_vars.append('GOOGLE_API_KEY')
-
-        if required_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(required_vars)}")
+        # Make GOOGLE_API_KEY optional: we can run without Google search support.
+        # If other required vars are added later, validate them here.
+        return
 
     @classmethod
     def setup_directories(cls):
         """Setup required directories"""
-        cls.SESSIONS_DIR.mkdir(exist_ok=True)
+        # We no longer create a sessions directory by default because history is
+        # stored in browser localStorage. Leave directory creation to explicit
+        # server-side deployments that still want it.
+        return
