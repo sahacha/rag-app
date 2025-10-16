@@ -80,7 +80,6 @@ st.components.v1.html(
 )
 
 chat_rag = st.Page("chat_rag.py", title="Chiang Mai Q&A Travel & Planing")
-chat_history = st.Page("tools/history.py", title="Chat History")
 pg = st.navigation(
     [chat_rag, chat_history]
 )
