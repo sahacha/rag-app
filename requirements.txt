@@ -5,3 +5,4 @@ langchain-google-genai
 langchain-core
 google-generativeai
 langchain-community
+sentence-transformers
