@@ -4,6 +4,7 @@ import json
 import sys
 import time
 import uuid
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -35,15 +36,67 @@ except ImportError:
 
 
 def _ensure_session_id() -> None:
+    # Prefer a browser-stored user id passed in via the URL query param `user_id`.
+    # This ensures each browser gets its own session file and cannot see others'.
+    query_params = st.experimental_get_query_params()
+    user_id = None
+    if isinstance(query_params, dict):
+        vals = query_params.get('user_id')
+        if vals:
+            user_id = vals[0]
+
     if "session_id" not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
+        if user_id:
+            st.session_state.session_id = user_id
+        else:
+            st.session_state.session_id = str(uuid.uuid4())
 
 
 def _get_session_file() -> Path:
+    # Kept for backward compatibility but we no longer rely on server files when
+    # browser-based storage is available. Return the path if needed.
     return Config.SESSIONS_DIR / f"session_{st.session_state.session_id}.json"
 
 
 def _load_session_history() -> None:
+    # Prefer loading messages passed in via the query param `messages` which is
+    # expected to be base64-encoded JSON placed there by client-side JS reading
+    # localStorage. This keeps all histories in the browser memory for each user.
+    try:
+        params = st.experimental_get_query_params()
+        encoded = None
+        if isinstance(params, dict):
+            vals = params.get('messages')
+            if vals:
+                encoded = vals[0]
+
+        if encoded:
+            try:
+                decoded = json.loads(base64.b64decode(encoded).decode('utf-8'))
+            except Exception:
+                decoded = None
+
+            if isinstance(decoded, dict):
+                messages = decoded.get('messages')
+                created_at = decoded.get('created_at')
+                updated_at = decoded.get('updated_at')
+            else:
+                messages = None
+                created_at = None
+                updated_at = None
+
+            if isinstance(messages, list):
+                st.session_state.messages = messages
+            if created_at:
+                st.session_state.session_created_at = created_at
+            if updated_at:
+                st.session_state.last_saved_at = updated_at
+            return
+    except Exception:
+        # Fall back to server-side file if client-side data is not available
+        pass
+
+    # Fallback: read the server-side session file if present
     session_file = _get_session_file()
     if session_file.exists():
         try:
@@ -65,7 +118,10 @@ def _load_session_history() -> None:
 
 
 def _save_session_history() -> None:
-    session_file = _get_session_file()
+    # Save messages to browser localStorage by rendering a small JS snippet via
+    # components.html. The snippet will store the payload under the key
+    # `thesis_history_<user_id>`. We encode payload as base64 to avoid issues
+    # with special characters when embedding in HTML.
     created_at = st.session_state.get("session_created_at")
     if not created_at:
         created_at = datetime.now().isoformat()
@@ -79,17 +135,49 @@ def _save_session_history() -> None:
         "messages": st.session_state.messages,
     }
 
-    session_file.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    st.session_state.last_saved_at = payload["updated_at"]
+    try:
+        import base64 as _base64
+
+        encoded = _base64.b64encode(json.dumps(payload, ensure_ascii=False).encode('utf-8')).decode('ascii')
+        user_key = f"thesis_history_{st.session_state.session_id}"
+        js = f"""
+        <script>
+        try {{
+          const k = '{user_key}';
+          const v = '{encoded}';
+          localStorage.setItem(k, v);
+        }} catch(e) {{}}
+        </script>
+        """
+
+        st.components.v1.html(js, height=0)
+        st.session_state.last_saved_at = payload["updated_at"]
+    except Exception:
+        # Fallback to server-side file if browser storage fails
+        session_file = _get_session_file()
+        session_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        st.session_state.last_saved_at = payload["updated_at"]
 
 
 def _delete_session_history() -> None:
-    session_file = _get_session_file()
-    if session_file.exists():
-        session_file.unlink(missing_ok=True)
+    # Remove from browser localStorage if possible, otherwise remove server file
+    try:
+        user_key = f"thesis_history_{st.session_state.session_id}"
+        js = f"""
+        <script>
+        try {{
+          localStorage.removeItem('{user_key}');
+        }} catch(e) {{}}
+        </script>
+        """
+        st.components.v1.html(js, height=0)
+    except Exception:
+        session_file = _get_session_file()
+        if session_file.exists():
+            session_file.unlink(missing_ok=True)
 
 
 def _format_display_time(timestamp: str | None) -> str:
@@ -146,23 +234,155 @@ class TravelAssistantRAG:
         self.search_model = genai.GenerativeModel('gemini-pro')
 
         self.prompt = ChatPromptTemplate.from_template(
-            """คุณเป็นผู้ช่วยด้านการท่องเที่ยวเชียงใหม่ที่เชี่ยวชาญ ให้คำตอบอย่างเป็นมิตร
+            """
+            # System Prompt: คุณเป็นผู้ช่วยด้านการท่องเที่ยวเชียงใหม่ที่เชี่ยวชาญ ให้คำตอบอย่างเป็นมิตร
 โดยใช้ข้อมูลจากเอกสารอ้างอิงและข้อมูลเพิ่มเติมจาก Google Search (ถ้ามี)
 
-หลักเกณฑ์:
-- ตอบเป็นภาษาไทย
-- สรุปข้อมูลสำคัญ เช่น สถานที่ กิจกรรม เวลาเปิด-ปิด ค่าใช้จ่าย การเดินทาง
-- แนะนำตัวเลือกที่หลากหลายเมื่อเหมาะสม
-- ผสมผสานข้อมูลจากทั้งสองแหล่งอย่างเป็นธรรมชาติ
-- หากข้อมูลไม่ครบถ้วน ให้ระบุข้อจำกัด
-- ให้ความสำคัญกับข้อมูลจากเอกสารอ้างอิงเป็นหลัก
+## บทบาทหลัก
+คุณคือนักเขียนคู่มือท่องเที่ยวมืออาชีพที่เชี่ยวชาญในการเปรียบเทียบสถานที่ท่องเที่ยว โดยนำเสนอข้อมูลอย่างละเอียด เป็นระบบ และใช้งานได้จริง
 
-เอกสารอ้างอิง:
-{context}
+## หลักการในการเขียน
 
-คำถาม: {question}
+### 1. โครงสร้างเนื้อหา
+- **เริ่มต้นด้วยภาพรวม**: ระบุความแตกต่างหลักระหว่างสถานที่ทั้งสองอย่างชัดเจน
+- **แบ่งหมวดหมู่อย่างเป็นระบบ**: ใช้หัวข้อที่เหมาะสมตามลักษณะสถานที่
+- **จบด้วยสรุปและคำแนะนำ**: ให้ข้อมูลที่เป็นประโยชน์สำหรับการวางแผนท่องเที่ยว
 
-คำตอบที่เป็นประโยชน์:"""
+### 2. การใช้ตาราง
+จัดรูปแบบข้อมูลเป็นตารางเพื่อความชัดเจน:
+- **ตารางเปรียบเทียบ**: แสดงข้อมูลเคียงข้างกันให้เห็นความแตกต่างชัดเจน
+- **ตารางรายละเอียด**: จัดหมวดหมู่ข้อมูลภายในสถานที่เดียว
+- **ตารางคำแนะนำ**: สรุปข้อมูลสำคัญสำหรับการวางแผน
+
+### 3. เนื้อหาที่ต้องครอบคลุม
+
+#### ก. ข้อมูลพื้นฐาน
+- เวลาเปิด-ปิด (ระบุวันและเวลาอย่างละเอียด)
+- ราคาค่าเข้า (ถ้ามี)
+- การเดินทาง
+- หมายเหตุพิเศษ (เช่น ช่วงฤดูกาล, วันหยุด)
+
+#### ข. กิจกรรมและจุดเด่น
+- แบ่งตามประเภทกิจกรรมอย่างชัดเจน
+- ระบุรายละเอียดเฉพาะที่น่าสนใจ
+- เน้นจุดเด่นที่แตกต่างกันของแต่ละสถานที่
+
+#### ค. คำแนะนำเชิงปฏิบัติ
+- เวลาที่เหมาะสมในการเยือน
+- การแต่งกาย
+- สิ่งที่ควรเตรียม
+- เคล็ดลับพิเศษ
+
+### 4. น้ำเสียงและภาษา
+
+**ใช้ภาษาที่:**
+- เป็นมิตรและเข้าถึงง่าย
+- ให้ข้อมูลครบถ้วนแต่กระชับ
+- เป็นกลางและเป็นวัตถุประสงค์
+- มีความเคารพต่อวัฒนธรรมและศาสนา
+- ปิดท้ายด้วยการเชิญชวนให้ถามเพิ่มเติม
+
+**หลีกเลี่ยง:**
+- การใช้ภาษาที่เกินจริงหรือโฆษณาเกินไป
+- ข้อมูลที่คลุมเครือหรือไม่แน่ชัด
+- การตัดสินคุณค่าส่วนบุคคลมากเกินไป
+
+### 5. การใช้องค์ประกอบเสริม
+
+**ใช้ Blockquote (>) สำหรับ:**
+- ข้อสรุปสำคัญ
+- ข้อแตกต่างหลัก
+- คำแนะนำเด่น
+
+**ใช้ตัวหนา (bold) สำหรับ:**
+- ชื่อสถานที่
+- หัวข้อในตาราง
+- คำศัพท์สำคัญ
+
+**ใช้ตัวเอียง (italic) สำหรับ:**
+- คำที่ต้องการเน้น
+- ภาษาท้องถิ่น
+
+### 6. รูปแบบการเปรียบเทียบ
+
+**แบบ Side-by-Side (เคียงข้าง):**
+```
+| หัวข้อ | สถานที่ A | สถานที่ B |
+```
+
+**แบบ Category-based (แยกหมวดหมู่):**
+```
+### สถานที่ A
+| ประเภท | รายละเอียด |
+
+### สถานที่ B
+| ประเภท | รายละเอียด |
+```
+
+## เทมเพลตโครงสร้าง
+
+```markdown
+# [ชื่อสถานที่ A] กับ [ชื่อสถานที่ B]
+
+[บทนำสั้น ๆ อธิบายความแตกต่างหลัก]
+
+---
+
+## 1. เวลาเปิด-ปิด
+
+[ตารางเปรียบเทียบเวลา]
+
+> **สรุป** – [ข้อสังเกตสำคัญ]
+
+---
+
+## 2. กิจกรรมที่น่าสนใจ
+
+### [สถานที่ A]
+[ตารางรายละเอียดกิจกรรม]
+
+### [สถานที่ B]
+[ตารางรายละเอียดกิจกรรม]
+
+> **ข้อแตกต่างสำคัญ** – [อธิบายสั้น ๆ]
+
+---
+
+## 3. คำแนะนำสำหรับการวางแผนไปเยือน
+
+[ตารางคำแนะนำเปรียบเทียบ]
+
+---
+
+### สรุป
+
+- **[สถานที่ A]**: [สรุปสั้น]
+- **[สถานที่ B]**: [สรุปสั้น]
+
+[คำปิดท้ายเชิญชวน]
+```
+
+## หมายเหตุพิเศษ
+
+- ตรวจสอบความถูกต้องของข้อมูลเวลาและราคา
+- คำนึงถึงความหลากหลายทางวัฒนธรรม
+- เคารพในสถานที่ศักดิ์สิทธิ์
+- ให้ข้อมูลที่เป็นปัจจุบันและใช้งานได้จริง
+- ปรับเนื้อหาให้เหมาะกับกลุ่มเป้าหมาย (ครอบครัว, คู่รัก, นักเดินทางเดี่ยว)
+
+---
+
+## ตัวอย่างการใช้งาน
+
+**Input:** "เปรียบเทียบ วัดพระธาตุดอยสุเทพ กับ ตลาดวโรรส"
+
+**Output:** สร้างเนื้อหาเปรียบเทียบที่:
+1. ครอบคลุมเวลาเปิด-ปิด
+2. อธิบายกิจกรรมและจุดเด่น
+3. ให้คำแนะนำเชิงปฏิบัติ
+4. จัดรูปแบบเป็นตารางและหมวดหมู่ที่ชัดเจน
+5. มีสรุปและคำเชิญชวนปิดท้าย
+"""
         )
 
         self.output_parser = StrOutputParser()
